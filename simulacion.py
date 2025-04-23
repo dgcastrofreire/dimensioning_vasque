@@ -3,11 +3,14 @@ import matplotlib.pyplot as plt
 import os
 import pandas as pd
 import numpy as np
-from shapely import GeometryCollection
-from shapely.geometry import Point, Polygon, MultiPolygon
+from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
 from shapely.prepared import prep
 from unidecode import unidecode
+from collections import Counter
+# --- Detectar y rellenar huecos en la cobertura ---
+from shapely import GeometryCollection, MultiPolygon
+import matplotlib.patches as mpatches
 
 # --- Ruta base ---
 base_path = r"C:\Users\Diego Castro\Documents\Uvigo\UPM\Asignaturas\Primero\Proyecto REQM-SCOM\Simulacion"
@@ -26,39 +29,28 @@ poblacion = pd.concat([pob_alava, pob_vizcaya, pob_gipuzkoa], ignore_index=True)
 poblacion = gpd.GeoDataFrame(poblacion, geometry='geometry', crs=pob_alava.crs)
 
 # --- Cargar radios personalizados desde CSV ---
-csv_radios_path = r"C:\Users\Diego Castro\Documents\Uvigo\UPM\Asignaturas\Primero\Proyecto REQM-SCOM\Simulacion\Radios_por_Ciudad.csv"
+csv_radios_path = os.path.join(base_path, "radios_personalizados2.csv")
 df_radios = pd.read_csv(csv_radios_path)
-radios_personalizados = dict(zip(df_radios['Ciudad'], df_radios['Radio_m']))
+df_radios['Ciudad_limpia'] = df_radios['Ciudad'].apply(lambda x: unidecode(str(x).lower().strip()))
+radios_personalizados = dict(zip(df_radios['Ciudad_limpia'], df_radios['Radio_m']))
 
-# --- Reproyección a CRS métrico ---
+# --- Reproyección ---
 pais_vasco_lim = pais_vasco_lim.to_crs(epsg=25830)
 poblacion = poblacion.to_crs(epsg=25830)
 
-# --- Detectar población y clasificar ---
-col_poblacion = [col for col in poblacion.columns if 'POB' in col.upper() or 'HAB' in col.upper()]
-col_pob = col_poblacion[0]
+# --- Clasificación y limpieza ---
+col_pob = [col for col in poblacion.columns if 'POB' in col.upper() or 'HAB' in col.upper()][0]
 poblacion[col_pob] = pd.to_numeric(poblacion[col_pob], errors='coerce')
 poblacion = poblacion[poblacion[col_pob] > 500].copy()
-
-
-def match_ciudad(nombre, radios_dict):
-    nombre_limpio = unidecode(nombre.lower().strip())
-    for ciudad in radios_dict:
-        ciudad_limpia = unidecode(ciudad.lower().strip())
-        if ciudad_limpia in nombre_limpio:
-            return radios_dict[ciudad]
-    return None
-
 
 def clasificar_nucleo(pob):
     if pob >= 20000:
         return "urbano"
-    elif pob >= 1000:
-        return "semiurbano"
     else:
         return "rural"
 
 poblacion['tipo_entorno'] = poblacion[col_pob].apply(clasificar_nucleo)
+poblacion['ciudad_limpia'] = poblacion['ETIQUETA'].apply(lambda x: unidecode(str(x).lower().strip()))
 
 # --- Crear hexágonos ---
 def crear_hexagono(centro, r):
@@ -89,14 +81,45 @@ def crear_hex_grid_en_poligono(poligono, radio, densidad=0.75, umbral_intersecci
         row += 1
     return hexagonos
 
-# --- Radios de cobertura ---
-tipos_radio = {
-    'micro_urbana': 105,
-    'macro_urbana': 1000,    # 🔧 reducido de 1290 → 800 para acercarnos a 500 celdas
-    'macro_rural': 6141
+densidades_personalizadas = {
+    'bilbao': 0.73,
+    'donostia/san sebastian': 0.57,
+    'vitoria-gasteiz': 0.35,
+    'irun': 0.54,
+    'durango': 0.74,
+    'laudio/llodio': 0.95,
+    'errenteria': 0.48,
+    'san vicente de barakaldo/san bizenti-barakaldo': 0.63,
+    'arizgoiti': 1.5,
+    'arrasate edo mondragon': 0.5,
+    'eibar': 0.55,
+    'portugalete': 1.05,
+    'sestao': 1.2,
+    'algorta': 0.7,
+    'las arenas-areeta': 0.7,
+    'zarautz': 0.65
+    # añade más si quieres afinar aún más
 }
 
-# --- Funciones para grids y clasificaciones ---
+def generar_micro_urbanas_personalizado():
+    micro_hexes = []
+    for _, row in poblacion.iterrows():
+        if row['tipo_entorno'] == 'urbano':
+            ciudad_limpia = unidecode(str(row['ETIQUETA']).lower().strip())
+            radio = radios_personalizados.get(ciudad_limpia, 500)
+            densidad = densidades_personalizadas.get(ciudad_limpia, 0.75)  # por defecto
+
+            hexagonos = crear_hex_grid_en_poligono(
+                row.geometry,
+                radio,
+                densidad=densidad,
+                umbral_interseccion=0.001
+            )
+
+            micro_hexes.extend([{'tipo': 'micro_urbana', 'ciudad': ciudad_limpia, 'geometry': h} for h in hexagonos])
+    return gpd.GeoDataFrame(micro_hexes, crs=poblacion.crs)
+
+# --- Generar macro_rural ---
 def crear_hex_grid(radio, espaciado):
     minx, miny, maxx, maxy = pais_vasco_lim.total_bounds
     dx = np.sqrt(3) * radio * espaciado
@@ -114,60 +137,37 @@ def crear_hex_grid(radio, espaciado):
         row += 1
     return gpd.GeoDataFrame(geometry=hex_centers, crs=pais_vasco_lim.crs)
 
-def clasificar_hex(pt, tipo):
+def clasificar_hex(pt):
     intersecta = poblacion[poblacion.geometry.intersects(pt.buffer(2500))]
     if intersecta.empty:
-        # Considerar como rural si no hay población en el área
-        return True if tipo == 'rural' else False
+        return True
     tipo_pred = intersecta['tipo_entorno'].value_counts().idxmax()
-    return tipo_pred == tipo
+    return tipo_pred == 'rural'
 
-def generar_micro_urbanas_personalizado():
-    micro_hexes = []
-    for _, row in poblacion.iterrows():
-        if row['tipo_entorno'] == 'urbano':
-            nombre = str(row.get('ETIQUETA', '')).lower().strip()
-            radio = None
-            for ciudad in radios_personalizados:
-                if ciudad.lower() in nombre:
-                    radio = radios_personalizados[ciudad]
-                    break
-            if radio is None:
-                radio = tipos_radio['micro_urbana']
-            hexagonos = crear_hex_grid_en_poligono(
-                row.geometry,
-                radio,
-                densidad=1,
-                umbral_interseccion=0.1
-            )
-            micro_hexes.extend([{'tipo': 'micro_urbana', 'geometry': h} for h in hexagonos])
-    return gpd.GeoDataFrame(micro_hexes, crs=poblacion.crs)
-
-# --- Generar celdas ---
-macro_rural = crear_hex_grid(tipos_radio['macro_rural'], 0.87)
+macro_rural = crear_hex_grid(14770, 0.87)
 macro_rural = macro_rural[macro_rural.geometry.within(pais_vasco_lim.unary_union)]
-macro_rural = macro_rural[macro_rural.geometry.apply(lambda g: clasificar_hex(g, 'rural'))]
+macro_rural = macro_rural[macro_rural.geometry.apply(clasificar_hex)]
 macro_rural['tipo'] = 'macro_rural'
-macro_rural['geometry'] = macro_rural.geometry.apply(lambda g: crear_hexagono(g, tipos_radio['macro_rural']))
+macro_rural['geometry'] = macro_rural.geometry.apply(lambda g: crear_hexagono(g, 14770))
 
-macro_urbana = crear_hex_grid(tipos_radio['macro_urbana'], 0.87)
-macro_urbana = macro_urbana[macro_urbana.geometry.within(pais_vasco_lim.unary_union)]
-macro_urbana = macro_urbana[macro_urbana.geometry.apply(lambda g: clasificar_hex(g, 'semiurbano'))]
-macro_urbana['tipo'] = 'macro_urbana'
-macro_urbana['geometry'] = macro_urbana.geometry.apply(lambda g: crear_hexagono(g, tipos_radio['macro_urbana']))
-
+# --- Generar microceldas
 micro_urbana = generar_micro_urbanas_personalizado()
 
-# --- Eliminar microceldas solapadas ---
-macro_union = unary_union(pd.concat([macro_rural, macro_urbana])['geometry'].tolist())
-micro_urbana = micro_urbana[~micro_urbana.geometry.apply(lambda g: prep(macro_union).contains(g))]
+# ⚠️ NO ELIMINES microceldas que se solapen con rurales
+# macro_union = unary_union(macro_rural.geometry.tolist())
+# micro_urbana = micro_urbana[~micro_urbana.geometry.apply(lambda g: prep(macro_union).contains(g))]
 
-# --- Combinar ---
-gdf_cobertura = pd.concat([macro_rural, macro_urbana, micro_urbana], ignore_index=True)
+# --- Combinar capas finales ---
+gdf_cobertura = pd.concat([macro_rural, micro_urbana], ignore_index=True)
 
-# --- Detectar y rellenar huecos ---
+
+# Crear geometría de cobertura actual
 cobertura_total = unary_union(gdf_cobertura.geometry)
+
+# Calcular diferencia entre el País Vasco y la cobertura actual
 huecos = pais_vasco_lim.unary_union.difference(cobertura_total)
+
+# Convertir a lista de polígonos válidos
 if isinstance(huecos, (Polygon, MultiPolygon)):
     huecos = [huecos] if isinstance(huecos, Polygon) else list(huecos.geoms)
 elif isinstance(huecos, GeometryCollection):
@@ -175,9 +175,10 @@ elif isinstance(huecos, GeometryCollection):
 else:
     huecos = []
 
+# Crear hexágonos en las zonas vacías
 nuevos_hex_centers = []
-dx = np.sqrt(3) * tipos_radio['macro_rural'] * 0.95
-dy = 1.5 * tipos_radio['macro_rural'] * 0.95
+dx = np.sqrt(3) * 14770 * 0.95
+dy = 1.5 * 14770 * 0.95
 minx, miny, maxx, maxy = pais_vasco_lim.total_bounds
 y = miny
 row = 0
@@ -186,40 +187,101 @@ while y < maxy + dy:
     x = minx + x_offset
     while x < maxx + dx:
         p = Point(x, y)
-        if any(h.intersects(p) for h in huecos):
+        hexagono = crear_hexagono(p, 14770)
+        if any(h.intersects(hexagono) for h in huecos):
             nuevos_hex_centers.append(p)
         x += dx
     y += dy
     row += 1
 
+
 hex_huecos = gpd.GeoDataFrame({
     'tipo': 'macro_rural',
-    'geometry': [crear_hexagono(p, tipos_radio['macro_rural']) for p in nuevos_hex_centers]
+    'geometry': [crear_hexagono(p, 14770) for p in nuevos_hex_centers]
 }, crs=pais_vasco_lim.crs)
 
+# --- FILTRAR Y AÑADIR HEXÁGONOS DE HUECOS ---
+
+umbral_interseccion_pais_vasco = 0.05  # mínimo 10% de área dentro del País Vasco
+umbral_solapamiento_existente = 0.3   # máximo 10% de solapamiento con cobertura ya existente
+
+# Unión del País Vasco y de cobertura actual
+union_pais_vasco = pais_vasco_lim.unary_union
+union_actual = unary_union(gdf_cobertura.geometry)
+
+# Crear hexágonos solo si:
+# - intersectan significativamente con el País Vasco
+# - no están ya cubiertos casi por completo
+hex_huecos_filtrados = []
+for p in nuevos_hex_centers:
+    h = crear_hexagono(p, 14770)
+
+    interseccion_pv = h.intersection(union_pais_vasco).area / h.area
+    interseccion_existente = h.intersection(union_actual).area / h.area
+
+    if interseccion_pv > umbral_interseccion_pais_vasco and interseccion_existente < (1 - umbral_solapamiento_existente):
+        hex_huecos_filtrados.append(h)
+
+# Crear GeoDataFrame final
+hex_huecos = gpd.GeoDataFrame({
+    'tipo': 'macro_rural',
+    'geometry': hex_huecos_filtrados
+}, crs=pais_vasco_lim.crs)
 
 # Añadir a la cobertura total
 gdf_cobertura = pd.concat([gdf_cobertura, hex_huecos], ignore_index=True)
 
-conteo = gdf_cobertura['tipo'].value_counts()
-print("\nNúmero de celdas por tipo:")
-print(conteo)
 
-# --- Visualización ---
+
+# --- Conteo por tipo y ciudad ---
+print("\nNúmero de celdas por tipo:")
+print(gdf_cobertura['tipo'].value_counts())
+
+conteo_micro = Counter(micro_urbana['ciudad'])
+print("\nNúmero de microceldas generadas por ciudad:")
+for ciudad in sorted(conteo_micro):
+    cantidad = conteo_micro[ciudad]
+    print(f"{ciudad.title()}: {cantidad}")
+
+
+# Ver ciudades urbanas que no generaron ninguna celda
+ciudades_urbanas = set(poblacion[poblacion['tipo_entorno'] == 'urbano']['ciudad_limpia'])
+ciudades_con_celdas = set(micro_urbana['ciudad'])
+faltan = ciudades_urbanas - ciudades_con_celdas
+
+print("\nCiudades urbanas que no generaron celdas:")
+for ciudad in sorted(faltan):
+    print(ciudad.title())
+    
+print(f"\nNúmero de nuevos hexágonos añadidos por huecos: {len(hex_huecos)}")
+# --- Visualization ---
 fig, ax = plt.subplots(figsize=(12, 12))
 
-print("Columnas del shapefile de núcleos de población:")
-print(poblacion.columns)
-
-#gdf_huecos_geom = gpd.GeoDataFrame(geometry=huecos, crs=pais_vasco_lim.crs)
-#gdf_huecos_geom.plot(ax=ax, color='none', edgecolor='magenta', linewidth=1, linestyle='--', zorder=10)
-
+# Plot boundaries
 pais_vasco_lim.boundary.plot(ax=ax, color='black', linewidth=0.5, zorder=1)
-gdf_cobertura[gdf_cobertura['tipo'] == 'macro_rural'].plot(ax=ax, facecolor='lightblue', edgecolor='blue', alpha=0.35, linewidth=0.4, label="Macro Rural", zorder=2)
-gdf_cobertura[gdf_cobertura['tipo'] == 'macro_urbana'].plot(ax=ax, color='orange', alpha=0.4, label="Macro Urbana", zorder=3)
-gdf_cobertura[gdf_cobertura['tipo'] == 'micro_urbana'].plot(ax=ax, color='red', alpha=0.4, label="Micro Urbana", zorder=4)
-poblacion.boundary.plot(ax=ax, color='black', linewidth=0.5, zorder=5)
-plt.title("Cobertura 5G realista con celdas ajustadas y densificadas por entorno")
-plt.legend(loc='lower left')
+
+# Plot macro rural cells (light blue)
+gdf_cobertura[gdf_cobertura['tipo'] == 'macro_rural'].plot(
+    ax=ax, color='lightblue', edgecolor='blue', alpha=0.35, linewidth=0.4, zorder=2
+)
+
+# Plot micro urban cells (red)
+micro_urbana.plot(
+    ax=ax, color='red', edgecolor='darkred', alpha=0.4, linewidth=0.2, zorder=3
+)
+
+# Plot population boundaries
+poblacion.boundary.plot(ax=ax, color='black', linewidth=0.5, zorder=4)
+
+# Legend patches
+legend_patches = [
+    mpatches.Patch(facecolor='lightblue', edgecolor='blue', label='Macro Rural Cell'),
+    mpatches.Patch(facecolor='red', edgecolor='darkred', label='Micro Urban Cell')
+]
+
+# Title and legend
+plt.title("5G Coverage in the Basque Country: Macro Rural and Micro Urban Cells", fontsize=14)
+plt.legend(handles=legend_patches, loc='lower left', fontsize=10)
 plt.axis('off')
+
 plt.show()
